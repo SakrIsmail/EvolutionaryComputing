@@ -51,9 +51,16 @@ from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
 )
 from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
 from ariel.ec.genotypes.tree.operators import random_tree
+from ariel.ec.genotypes.tree.tree_genome import TreeGenome
 from ariel.simulation.environments import SimpleFlatWorld
 from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.video_recorder import VideoRecorder
+from ariel.ec import (
+    EA,
+    EAOperation,
+    Individual,
+    Population,
+)
 
 
 # Type aliases
@@ -83,7 +90,7 @@ DATA.mkdir(parents=True, exist_ok=True)
 # --- EXPERIMENT CONSTANTS --- #
 TARGET_DIR: Path = HERE / "target_bodies"  # the bodies you must approach
 NUM_OF_MODULES: int = 20  # module budget per evolved body
-GENOTYPE: GenotypeTypes = "tree"  # "nde" | "tree" 
+GENOTYPE: GenotypeTypes = "nde"  # "nde" | "tree" 
 MODE: ViewerTypes = "frame"  # see show_body() for the options
 SPAWN_POS: list[float] = [0.0, 0.0, 0.1]
 
@@ -323,42 +330,139 @@ def show_body(
 # ============================================================================ #
 #  5. ENTRY POINT
 # ============================================================================ #
+def random_genotype(
+    genotype: GenotypeTypes = GENOTYPE,
+    num_modules: int = NUM_OF_MODULES,
+) -> dict | list[list[float]]:
+    """Sample one random body using the chosen encoding."""
+    match genotype:
+        case "nde":
+            return [
+                RNG.uniform(-1.0, 1.0, GENOTYPE_SIZE)
+                .astype(np.float32)
+                .tolist()
+                for _ in range(3)
+            ]
+        case "tree":
+            genome = random_tree(max_modules=num_modules)
+            return genome.to_dict()
+
+
+def initialize_population(
+    n_individuals: int,
+    genotype: GenotypeTypes,
+    num_modules: int,
+) -> Population:
+    individuals = []
+
+    for _ in range(n_individuals):
+        individual = Individual()
+        individual.genotype = random_genotype(genotype, num_modules)
+        individuals.append(individual)
+
+    return Population(individuals)
+
+def decode_genotype(
+    individual: Individual,
+    genotype: GenotypeTypes,
+    num_modules: int,
+) -> nx.DiGraph:
+    match genotype:
+        case "nde":
+            type_p, conn_p, rot_p = _NDE.forward(individual.genotype)
+            decoder = HighProbabilityDecoder(num_modules)
+            return decoder.probability_matrices_to_graph(
+                type_p,
+                conn_p,
+                rot_p,
+            )
+        case "tree":
+            genome = TreeGenome.from_dict(individual.genotype)
+            return genome.to_networkx()
+
+def evaluate(
+    population: Population,
+    genotype: GenotypeTypes,
+    num_modules: int,
+    targets: list[nx.DiGraph],
+) -> Population:
+    for individual in population.unevaluated:
+        body = decode_genotype(individual, genotype, num_modules)
+        individual.fitness = fitness_function(body, targets)
+
+    return population
+
+def parent_selection(population: Population) -> Population:
+
+    shuffled = population.shuffle()
+    for idx in range(0, len(shuffled) - 1, 2):
+        ind_a = shuffled[idx]
+        ind_b = shuffled[idx + 1]
+        if ind_a.fitness_ is not None and ind_b.fitness_ is not None:
+            if ind_a.fitness_ <= ind_b.fitness_:
+                ind_a.tags = {"selected": True}
+                ind_b.tags = {"selected": False}
+            else:
+                ind_a.tags = {"selected": False}
+                ind_b.tags = {"selected": True}
+
+    return shuffled
+
 
 
 def main() -> None:
-    """Score one randomly-sampled body against the target set."""
     targets = load_targets()
 
-    console.log(f"encoding      : {GENOTYPE}")
-    console.log(f"module budget : {NUM_OF_MODULES}")
-    console.log(f"targets       : {len(targets)} bodies from {TARGET_DIR.name}")
-    console.log(
-        "target sizes  : "
-        + ", ".join(str(t.number_of_nodes()) for t in targets),
+    population = initialize_population(
+    n_individuals=100,
+    genotype=GENOTYPE,
+    num_modules=NUM_OF_MODULES,
     )
 
-    # How far apart are the targets from each other? Your fitness cannot go
-    # below the best possible compromise, and this is the clue to where that is.
-    spread = [
-        tree_edit_distance(a, b)
-        for i, a in enumerate(targets)
-        for b in targets[i + 1 :]
-    ]
-    console.log(f"target spread : mean pairwise distance {np.mean(spread):.2f}")
-
-    # --- One random body --------------------------------------------------- #
-    body = random_body(GENOTYPE, NUM_OF_MODULES)
-    fitness = fitness_function(body, targets)
-
-    console.log("")
-    console.log(f"random body   : {body.number_of_nodes()} modules")
-    console.log(
-        "per-target    : "
-        + ", ".join(f"{d:.1f}" for d in distances_to_targets(body, targets)),
+    population = evaluate(
+        population=population,
+        genotype=GENOTYPE,
+        num_modules=NUM_OF_MODULES,
+        targets=targets
     )
-    console.log(f"fitness       : {fitness:.4f}   (lower is better)")
 
-    show_body(body, MODE, file_name=f"random_{GENOTYPE}")
+
+
+
+# def main() -> None:
+#     """Score one randomly-sampled body against the target set."""
+#     targets = load_targets()
+
+#     console.log(f"encoding      : {GENOTYPE}")
+#     console.log(f"module budget : {NUM_OF_MODULES}")
+#     console.log(f"targets       : {len(targets)} bodies from {TARGET_DIR.name}")
+#     console.log(
+#         "target sizes  : "
+#         + ", ".join(str(t.number_of_nodes()) for t in targets),
+#     )
+
+#     # How far apart are the targets from each other? Your fitness cannot go
+#     # below the best possible compromise, and this is the clue to where that is.
+#     spread = [
+#         tree_edit_distance(a, b)
+#         for i, a in enumerate(targets)
+#         for b in targets[i + 1 :]
+#     ]
+#     console.log(f"target spread : mean pairwise distance {np.mean(spread):.2f}")
+
+#     # --- One random body --------------------------------------------------- #
+#     body = random_body(GENOTYPE, NUM_OF_MODULES)
+#     fitness = fitness_function(body, targets)
+
+#     console.log("")
+#     console.log(f"random body   : {body.number_of_nodes()} modules")
+#     console.log(
+#         "per-target    : "
+#         + ", ".join(f"{d:.1f}" for d in distances_to_targets(body, targets)),
+#     )
+#     console.log(f"fitness       : {fitness:.4f}   (lower is better)")
+
+#     show_body(body, MODE, file_name=f"random_{GENOTYPE}")
 
 
 if __name__ == "__main__":
