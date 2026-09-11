@@ -50,14 +50,20 @@ from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
     HighProbabilityDecoder,
 )
 from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
-from ariel.ec.genotypes.tree.operators import random_tree
+from ariel.ec.genotypes.tree.operators import (
+    crossover_subtree,
+    mutate_replace_node,
+    random_tree,
+)
 from ariel.ec.genotypes.tree.tree_genome import TreeGenome
 from ariel.simulation.environments import SimpleFlatWorld
 from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.video_recorder import VideoRecorder
 from ariel.ec import (
+    Archive,
     EA,
     EAOperation,
+    FloatMutator,
     Individual,
     Population,
 )
@@ -75,7 +81,7 @@ type ViewerTypes = Literal["launcher", "video", "frame", "none"]
 # network's weight initialisation uses torch's own RNG, entirely separate from
 # numpy/random. If you're using "nde", seed all THREE or your runs will not be
 # reproducible across separate script runs, even with the same seed value.
-SEED = 42
+SEED = 46
 RNG = np.random.default_rng(SEED)
 random.seed(SEED)
 torch.manual_seed(SEED)
@@ -93,8 +99,11 @@ NUM_OF_MODULES: int = 20  # module budget per evolved body
 GENOTYPE: GenotypeTypes = "nde"  # "nde" | "tree" 
 MODE: ViewerTypes = "frame"  # see show_body() for the options
 SPAWN_POS: list[float] = [0.0, 0.0, 0.1]
-
-
+CROSSOVER = "n_point" # "uniform" | "n_point" 
+N_CUTS = 4
+STARTER_SIZE = 100
+TARGET_POPULATION = 100
+STEPS = 100
 # ============================================================================ #
 #  1. THE TARGET BODIES
 # ============================================================================ #
@@ -331,63 +340,50 @@ def show_body(
 #  5. ENTRY POINT
 # ============================================================================ #
 def random_genotype(
-    genotype: GenotypeTypes = GENOTYPE,
     num_modules: int = NUM_OF_MODULES,
 ) -> dict | list[list[float]]:
     """Sample one random body using the chosen encoding."""
-    match genotype:
-        case "nde":
-            return [
-                RNG.uniform(-1.0, 1.0, GENOTYPE_SIZE)
-                .astype(np.float32)
-                .tolist()
-                for _ in range(3)
-            ]
-        case "tree":
-            genome = random_tree(max_modules=num_modules)
-            return genome.to_dict()
+    return [
+        RNG.uniform(-1.0, 1.0, GENOTYPE_SIZE)
+        .astype(np.float32)
+        .tolist()
+        for _ in range(3)
+    ]
 
 
 def initialize_population(
     n_individuals: int,
-    genotype: GenotypeTypes,
     num_modules: int,
 ) -> Population:
     individuals = []
 
     for _ in range(n_individuals):
         individual = Individual()
-        individual.genotype = random_genotype(genotype, num_modules)
+        individual.genotype = random_genotype(num_modules)
         individuals.append(individual)
 
     return Population(individuals)
 
 def decode_genotype(
     individual: Individual,
-    genotype: GenotypeTypes,
     num_modules: int,
 ) -> nx.DiGraph:
-    match genotype:
-        case "nde":
-            type_p, conn_p, rot_p = _NDE.forward(individual.genotype)
-            decoder = HighProbabilityDecoder(num_modules)
-            return decoder.probability_matrices_to_graph(
-                type_p,
-                conn_p,
-                rot_p,
-            )
-        case "tree":
-            genome = TreeGenome.from_dict(individual.genotype)
-            return genome.to_networkx()
+    type_p, conn_p, rot_p = _NDE.forward(individual.genotype)
+    decoder = HighProbabilityDecoder(num_modules)
+    return decoder.probability_matrices_to_graph(
+        type_p,
+        conn_p,
+        rot_p,
+    )
+
 
 def evaluate(
     population: Population,
-    genotype: GenotypeTypes,
-    num_modules: int,
-    targets: list[nx.DiGraph],
 ) -> Population:
+    targets = load_targets()
+
     for individual in population.unevaluated:
-        body = decode_genotype(individual, genotype, num_modules)
+        body = decode_genotype(individual, NUM_OF_MODULES)
         individual.fitness = fitness_function(body, targets)
 
     return population
@@ -408,25 +404,174 @@ def parent_selection(population: Population) -> Population:
 
     return shuffled
 
+def uniform_crossover(
+    genotype_a: list[list[float]],
+    genotype_b: list[list[float]],
+) -> tuple[list[list[float]], list[list[float]]]:
+    parent_a = np.asarray(genotype_a, dtype=np.float32)
+    parent_b = np.asarray(genotype_b, dtype=np.float32)
+
+    mask = RNG.random(parent_a.shape) < 0.5
+
+    child_a = np.where(mask, parent_a, parent_b)
+    child_b = np.where(mask, parent_b, parent_a)
+
+    return child_a.tolist(), child_b.tolist()
+
+def n_point_crossover(
+    genotype_a: list[list[float]],
+    genotype_b: list[list[float]],
+) -> tuple[list[list[float]], list[list[float]]]:
+
+    parent_a = np.asarray(genotype_a, dtype=np.float32)
+    parent_b = np.asarray(genotype_b, dtype=np.float32)
+
+    flat_a = parent_a.flatten()
+    flat_b = parent_b.flatten()
+
+    cut_points = sorted(
+        RNG.choice(
+            np.arange(1, len(flat_a)),
+            size=N_CUTS,
+            replace=False,
+        ).tolist(),
+    )
+
+    boundaries = [0, *cut_points, len(flat_a)]
+
+    child_a = flat_a.copy()
+    child_b = flat_b.copy()
+
+    for segment_index, (start, end) in enumerate(
+        zip(boundaries[:-1], boundaries[1:]),
+    ):
+        if segment_index % 2 == 1:
+            child_a[start:end] = flat_b[start:end]
+            child_b[start:end] = flat_a[start:end]
+
+    return (
+        child_a.reshape(parent_a.shape).tolist(),
+        child_b.reshape(parent_b.shape).tolist(),
+    )
+    
+
+def crossover(
+    population: Population,
+) -> Population:
+    parents = population.where(lambda ind: bool(ind.tags.get("selected", False)))
+
+    for idx in range(0, len(parents) - 1, 2):
+        parent_a = parents[idx]
+        parent_b = parents[idx + 1]
+
+        if CROSSOVER == "uniform":
+            child_genotype_a, child_genotype_b = uniform_crossover(
+                parent_a.genotype,
+                parent_b.genotype,
+            )
+        elif CROSSOVER == "n_point":
+            child_genotype_a, child_genotype_b = n_point_crossover(
+                parent_a.genotype,
+                parent_b.genotype,
+            )
+
+
+        child_a = Individual()
+        child_a.genotype = child_genotype_a
+        child_a.tags = {"mutate": True}
+
+        child_b = Individual()
+        child_b.genotype = child_genotype_b
+        child_b.tags = {"mutate": True}
+
+        population.extend([child_a, child_b])
+
+    return population
+
+def mutate(population: Population) -> Population:
+    for ind in population.where(lambda ind: bool(ind.tags.get("mutate", False))):
+        mutated_genotype = [
+            FloatMutator.gaussian(
+                chromosome,
+                std=0.1,
+                mutation_probability=0.1,
+                lower_bound=-1.0,
+                upper_bound=1.0,
+            )
+            for chromosome in ind.genotype
+        ]
+        ind.genotype = mutated_genotype
+
+        ind.requires_eval = True
+
+    return population
+
+def survivor_selection(population: Population) -> Population:
+    ranked = population.alive.sort(
+        sort="min",
+        attribute="fitness_",
+    )
+
+    survivors = ranked[:TARGET_POPULATION]
+
+    for individual in population:
+        individual.alive = individual in survivors
+
+    return population
 
 
 def main() -> None:
-    targets = load_targets()
+    database_path = DATA / f"{CROSSOVER}_seed_{SEED}.db"
 
     population = initialize_population(
-    n_individuals=100,
-    genotype=GENOTYPE,
+    n_individuals=STARTER_SIZE,
     num_modules=NUM_OF_MODULES,
     )
 
     population = evaluate(
         population=population,
-        genotype=GENOTYPE,
-        num_modules=NUM_OF_MODULES,
-        targets=targets
     )
 
+    ops: list[EAOperation] = [
+            EAOperation(parent_selection),
+            EAOperation(crossover),
+            EAOperation(mutate),
+            EAOperation(evaluate),
+            EAOperation(survivor_selection),
+        ]
 
+    ea = EA(
+        population,
+        ops,
+        num_steps=STEPS, 
+        is_maximisation=False, 
+        db_file_path=database_path,
+        db_handling="delete",
+        )
+    ea.run()
+
+    console.log("--- Results ---")
+    console.log(f"best = {ea.get_solution('best', only_alive=False)}")
+    console.log(f"median = {ea.get_solution('median', only_alive=False)}")
+    console.log(f"worst = {ea.get_solution('worst', only_alive=False)}")
+
+    archive = Archive(database_path)
+
+    first_generation, last_generation = archive.generation_range
+
+    print("\nFitness over generations:")
+
+    for generation in range(first_generation, last_generation + 1):
+        statistics = archive.fitness_stats(
+            birth_range=(generation, generation),
+        )
+
+        print(
+            f"Generation {generation}: "
+            f"best={statistics['min']:.4f}, "
+            f"mean={statistics['mean']:.4f}, "
+            f"worst={statistics['max']:.4f}",
+        )
 
 
 # def main() -> None:
