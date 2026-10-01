@@ -77,6 +77,13 @@ def subtree_swap(a: TreeGenome, b: TreeGenome, a_node: int, b_node: int) -> None
         nodes = {n: genome.nodes[n] for n in subnodes}
         return nodes, internal_edges
 
+    def find_parent_edge(genome: TreeGenome, node_id: int) -> tuple[int, str] | tuple[None, None]:
+        # find node_id's current (parent, face)
+        for e in genome.edges:
+            if e["child"] == node_id:
+                return e["parent"], e["face"]
+        return None, None
+
     def reassign_ids(
         nodes: dict[int, dict[str, str]],
         edges: list[dict[str, Any]],
@@ -108,6 +115,10 @@ def subtree_swap(a: TreeGenome, b: TreeGenome, a_node: int, b_node: int) -> None
     a_nodes, a_edges = extract_subtree(a, a_node)
     b_nodes, b_edges = extract_subtree(b, b_node)
 
+    # save attachment points for reattaching after the swap
+    a_parent, a_face = find_parent_edge(a, a_node)
+    b_parent, b_face = find_parent_edge(b, b_node)
+
     # remove the chosen branches from their parents
     remove_subtree(a, a_node)
     remove_subtree(b, b_node)
@@ -117,13 +128,19 @@ def subtree_swap(a: TreeGenome, b: TreeGenome, a_node: int, b_node: int) -> None
     b_existing = set(b.nodes.keys())
 
     # reassign identifiers before inserting into the other genome
-    b_nodes_new, b_edges_new, _ = reassign_ids(b_nodes, b_edges, a_existing)
-    a_nodes_new, a_edges_new, _ = reassign_ids(a_nodes, a_edges, b_existing)
+    b_nodes_new, b_edges_new, b_mapping = reassign_ids(b_nodes, b_edges, a_existing)
+    a_nodes_new, a_edges_new, a_mapping = reassign_ids(a_nodes, a_edges, b_existing)
 
     a.nodes.update(b_nodes_new)
     a.edges.extend(b_edges_new)
     b.nodes.update(a_nodes_new)
     b.edges.extend(a_edges_new)
+
+    # reattach incoming subtree at the saved point (skip if node had no parent)
+    if a_parent is not None:
+        a.edges.append({"parent": a_parent, "child": b_mapping[b_node], "face": a_face})
+    if b_parent is not None:
+        b.edges.append({"parent": b_parent, "child": a_mapping[a_node], "face": b_face})
 
     # clean up any now-invalid connections and perform final checks
     _prune_invalid_edges(a)
