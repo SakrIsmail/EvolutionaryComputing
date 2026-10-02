@@ -25,19 +25,26 @@ a rendered video, or a single frame.
 """
 
 # Standard library
+import argparse
+from tqdm import tqdm
 from pathlib import Path
 from typing import Literal
+import sqlite3
 
 # Third-party libraries
+import matplotlib.pyplot as plt
 import mujoco as mj
 import numpy as np
 import numpy.typing as npt
 from mujoco import viewer
+from itertools import combinations
+from scipy.stats import kruskal, mannwhitneyu
 
 # Local libraries (ARIEL)
 from ariel import console
 from ariel.body_phenotypes.robogen_lite.modules.core import CoreModule
-from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
+# from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
+from ariel.body_phenotypes.robogen_lite.prebuilt_robots.john_set import gecko
 from ariel.ec import set_seed
 from ariel.simulation.environments import SimpleFlatWorld
 from ariel.utils.renderers import single_frame_renderer, video_renderer
@@ -58,13 +65,13 @@ type ViewerTypes = Literal["launcher", "video", "simple", "frame", "no_control"]
 # --- RANDOM GENERATOR SETUP --- #
 # Fix the seed while you are debugging.
 # Report results over MULTIPLE seeds.
-SEED = 42
-RNG = np.random.default_rng(SEED)
+# SEED = 42
+# RNG = np.random.default_rng(SEED)
 
 # ariel.ec's own generators/mutators/crossover draw from a separate,
 # package-level RNG. Reseed it too if you build your EA on ariel.ec,
 # or every one of your "multiple seeds" runs the same variation operators.
-set_seed(SEED)
+# set_seed(SEED)
 
 # --- DATA SETUP --- #
 SCRIPT_NAME = Path(__file__).stem
@@ -77,11 +84,11 @@ SPAWN_POS: list[float] = [0.0, 0.0, 0.1]  # where the robot starts
 TARGET_POSITION: list[float] = [2.0, 0.0, 0.1]  # where it should end up
 SIM_DURATION: float = 15.0  # seconds of simulated time per evaluation
 MODE: ViewerTypes = "simple"  # see run_experiment() for the options
-CROSSOVER = "n_point" # "uniform" | "n_point" 
-N_CUTS = 4
-STARTER_SIZE = 20
-TARGET_POPULATION = 20
-STEPS = 100
+# CROSSOVER = "n_point" # "uniform" | "n_point"
+# N_CUTS = 4
+# STARTER_SIZE = 20
+# TARGET_POPULATION = 20
+# STEPS = 100
 
 
 # ============================================================================ #
@@ -189,6 +196,7 @@ def nn_controller(
 def make_random_weights(
     input_size: int,
     output_size: int,
+    rng: np.random.Generator,
 ) -> list[npt.NDArray[np.float64]]:
     """Draw a random parameter set for `nn_controller`.
 
@@ -200,8 +208,8 @@ def make_random_weights(
     genotype back into these matrices is on you.
     """
     return [
-        RNG.normal(scale=0.5, size=(input_size, HIDDEN_SIZE)).tolist(),
-        RNG.normal(scale=0.5, size=(HIDDEN_SIZE, output_size)).tolist(),
+        rng.normal(scale=0.5, size=(input_size, HIDDEN_SIZE)).tolist(),
+        rng.normal(scale=0.5, size=(HIDDEN_SIZE, output_size)).tolist(),
     ]
 
 
@@ -277,12 +285,13 @@ def initialize_population(
     n_individuals: int,
     input_size: int,
     output_size: int,
+    rng: np.random.Generator,
 ) -> Population:
     individuals = []
 
     for _ in range(n_individuals):
         individual = Individual()
-        individual.genotype = make_random_weights(input_size, output_size)
+        individual.genotype = make_random_weights(input_size, output_size, rng)
         individuals.append(individual)
 
     return Population(individuals)
@@ -293,7 +302,7 @@ def evaluate(
 
     for individual in population.unevaluated:
         weights = individual.genotype
-        individual.fitness = run_experiment(weights)
+        individual.fitness = run_experiment(weights, mode="simple")
 
     return population
 
@@ -335,12 +344,13 @@ def log_progress(population: Population) -> Population:
 def uniform_crossover(
     genotype_a: list[npt.NDArray[np.float64]],
     genotype_b: list[npt.NDArray[np.float64]],
+    rng: np.random.Generator,
 ) -> tuple[list[npt.NDArray[np.float32]], list[npt.NDArray[np.float32]]]:
 
     flat_a, shapes = _flatten_genotype(genotype_a)
     flat_b, _ = _flatten_genotype(genotype_b)
 
-    mask = RNG.random(flat_a.shape) < 0.5
+    mask = rng.random(flat_a.shape) < 0.5
     child_flat_a = np.where(mask, flat_a, flat_b)
     child_flat_b = np.where(mask, flat_b, flat_a)
 
@@ -352,15 +362,17 @@ def uniform_crossover(
 def n_point_crossover(
     genotype_a: list[npt.NDArray[np.float64]],
     genotype_b: list[npt.NDArray[np.float64]],
+    n_cuts: int,
+    rng: np.random.Generator,
 ) -> tuple[list[npt.NDArray[np.float32]], list[npt.NDArray[np.float32]]]:
     
     flat_a, shapes = _flatten_genotype(genotype_a)
     flat_b, _ = _flatten_genotype(genotype_b)
 
     cut_points = sorted(
-        RNG.choice(
+        rng.choice(
             np.arange(1, len(flat_a)),
-            size=N_CUTS,
+            size=n_cuts,
             replace=False,
         ).tolist(),
     )
@@ -382,38 +394,43 @@ def n_point_crossover(
 
     return child_a, child_b
 
-def crossover(
-    population: Population,
-) -> Population:
-    parents = population.where(lambda ind: bool(ind.tags.get("selected", False)))
+def create_crossover_operator(crossover_type: str, n_cuts: int, rng: np.random.Generator):
+    def crossover(
+        population: Population,
+    ) -> Population:
+        parents = population.where(lambda ind: bool(ind.tags.get("selected", False)))
 
-    for idx in range(0, len(parents) - 1, 2):
-        parent_a = parents[idx]
-        parent_b = parents[idx + 1]
+        for idx in range(0, len(parents) - 1, 2):
+            parent_a = parents[idx]
+            parent_b = parents[idx + 1]
 
-        if CROSSOVER == "uniform":
-            child_genotype_a, child_genotype_b = uniform_crossover(
-                parent_a.genotype,
-                parent_b.genotype,
-            )
-        elif CROSSOVER == "n_point":
-            child_genotype_a, child_genotype_b = n_point_crossover(
-                parent_a.genotype,
-                parent_b.genotype,
-            )
+            if crossover_type == "uniform":
+                child_genotype_a, child_genotype_b = uniform_crossover(
+                    parent_a.genotype,
+                    parent_b.genotype,
+                    rng
+                )
+            elif crossover_type == "n_point":
+                child_genotype_a, child_genotype_b = n_point_crossover(
+                    parent_a.genotype,
+                    parent_b.genotype,
+                    n_cuts,
+                    rng
+                )
 
 
-        child_a = Individual()
-        child_a.genotype = child_genotype_a
-        child_a.tags = {"mutate": True}
+            child_a = Individual()
+            child_a.genotype = child_genotype_a
+            child_a.tags = {"mutate": True}
 
-        child_b = Individual()
-        child_b.genotype = child_genotype_b
-        child_b.tags = {"mutate": True}
+            child_b = Individual()
+            child_b.genotype = child_genotype_b
+            child_b.tags = {"mutate": True}
 
-        population.extend([child_a, child_b])
+            population.extend([child_a, child_b])
 
-    return population
+        return population
+    return crossover
 
 def mutate(population: Population) -> Population:
     for ind in population.where(lambda ind: bool(ind.tags.get("mutate", False))):
@@ -432,18 +449,20 @@ def mutate(population: Population) -> Population:
 
     return population
 
-def survivor_selection(population: Population) -> Population:
-    ranked = population.alive.sort(
-        sort="min",
-        attribute="fitness_",
-    )
+def create_survivor_selection(target_pop_size: int):
+    def survivor_selection(population: Population) -> Population:
+        ranked = population.alive.sort(
+            sort="min",
+            attribute="fitness_",
+        )
 
-    survivors = ranked[:TARGET_POPULATION]
+        survivors = ranked[:target_pop_size]
 
-    for individual in population:
-        individual.alive = individual in survivors
+        for individual in population:
+            individual.alive = individual in survivors
 
-    return population
+        return population
+    return survivor_selection
 
 
 def run_experiment(weights, mode: ViewerTypes = MODE) -> float:
@@ -481,8 +500,8 @@ def run_experiment(weights, mode: ViewerTypes = MODE) -> float:
     # --- Wire up the controller -------------------------------------------- #
     # Sizes are read from the compiled model, never hardcoded - they depend on
     # the body you chose in build_robot().
-    input_size = len(data.qpos)
-    output_size = model.nu
+    # input_size = len(data.qpos)
+    # output_size = model.nu
 
     # weights = make_random_weights(input_size, output_size)
 
@@ -544,11 +563,156 @@ def run_experiment(weights, mode: ViewerTypes = MODE) -> float:
 
     return fitness
 
+def run_random_search_baseline(
+    total_evaluations: int,
+    input_size: int,
+    output_size: int,
+    seed: int,
+    db_path: Path,
+):
+    """Random Search baseline evaluated over the exact same total budget."""
+    rng = np.random.default_rng(seed)
+    best_fitness = float("inf")
+    history = []
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        "CREATE TABLE IF NOT EXISTS baseline (evaluation INT, best_fitness REAL)"
+    )
+
+    # Wrap the range in tqdm to display progress and remaining time
+    for eval_idx in tqdm(
+        range(1, total_evaluations + 1),
+        desc=f"Baseline Seed {seed}",
+        unit="eval",
+    ):
+        weights = make_random_weights(input_size, output_size, rng)
+        fitness = run_experiment(weights, mode="simple")
+        if fitness < best_fitness:
+            best_fitness = fitness
+        history.append((eval_idx, best_fitness))
+        cursor.execute("INSERT INTO baseline VALUES (?, ?)", (eval_idx, best_fitness))
+
+    conn.commit()
+    conn.close()
+    console.log(f"[Random Search Seed {seed}] Final Best Fitness: {best_fitness:.4f}")
+
+
+def analyze_and_plot(exp_names: list[str], seeds: list[int], pop_size: int = 20):
+    """Aggregates multi-seed DB files, plots mean +/- std curves, and performs 3-way statistical testing."""
+    colors = ["blue", "orange", "green", "purple", "red"]
+    results_by_exp = {}
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    for idx, exp_name in enumerate(exp_names):
+        color = colors[idx % len(colors)]
+        seed_histories = []
+        final_bests = []
+
+        for seed in seeds:
+            db_file = DATA / f"{exp_name}_seed_{seed}.db"
+            if not db_file.exists():
+                console.log(f"Warning: {db_file} not found. Skipping.")
+                continue
+
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+
+            if "baseline" in exp_name:
+                cursor.execute("SELECT best_fitness FROM baseline ORDER BY evaluation")
+                raw_vals = [r[0] for r in cursor.fetchall()]
+                vals = [raw_vals[i] for i in range(pop_size - 1, len(raw_vals), pop_size)]
+            else:
+                cursor.execute(
+                    "SELECT time_of_birth, MIN(fitness_) "
+                    "FROM individual "
+                    "WHERE fitness_ IS NOT NULL "
+                    "GROUP BY time_of_birth "
+                    "ORDER BY time_of_birth"
+                )
+                raw_bests = [r[1] for r in cursor.fetchall()]
+                vals = list(np.minimum.accumulate(raw_bests)) if raw_bests else []
+
+            conn.close()
+
+            if vals:
+                seed_histories.append(vals)
+                final_bests.append(vals[-1])
+
+        if seed_histories:
+            results_by_exp[exp_name] = final_bests
+            min_len = min(len(h) for h in seed_histories)
+            truncated = np.array([h[:min_len] for h in seed_histories])
+            mean_curve = np.mean(truncated, axis=0)
+            std_curve = np.std(truncated, axis=0)
+
+            steps = np.arange(1, min_len + 1)
+            ax.plot(steps, mean_curve, label=exp_name, color=color, linewidth=2)
+            ax.fill_between(
+                steps,
+                mean_curve - std_curve,
+                mean_curve + std_curve,
+                color=color,
+                alpha=0.15,
+            )
+
+    ax.set_xlabel("Generations")
+    ax.set_ylabel("Fitness (Distance to Target)")
+    ax.set_title("Multi-Condition Evolutionary Progress")
+    ax.legend()
+    ax.grid(True)
+
+    plot_path = DATA / "all_conditions_plot.png"
+    plt.savefig(plot_path, dpi=300)
+    console.log(f"\nCombined plot saved to: {plot_path}")
+
+    # --- STATISTICAL TESTS --- #
+    console.log("\n=================== STATISTICAL ANALYSIS ===================")
+    for exp_name, bests in results_by_exp.items():
+        console.log(f"{exp_name:15s} | Mean Best: {np.mean(bests):.4f} +/- {np.std(bests):.4f}")
+
+    if len(results_by_exp) >= 3:
+        kw_stat, kw_p = kruskal(*results_by_exp.values())
+        console.log(f"\n--- Kruskal-Wallis Test (All Groups) ---")
+        console.log(f"H-statistic: {kw_stat:.4f}, p-value: {kw_p:.5f}")
+
+    num_pairs = len(list(combinations(results_by_exp.keys(), 2)))
+    if num_pairs > 0:
+        adjusted_alpha = 0.05 / num_pairs
+        console.log(f"\n--- Pairwise Mann-Whitney U (Bonferroni Adjusted Alpha = {adjusted_alpha:.4f}) ---")
+
+        for exp_a, exp_b in combinations(results_by_exp.keys(), 2):
+            u_stat, p_val = mannwhitneyu(results_by_exp[exp_a], results_by_exp[exp_b], alternative="two-sided")
+            sig = "SIGNIFICANT" if p_val < adjusted_alpha else "NOT significant"
+            console.log(f"{exp_a:12s} vs {exp_b:12s} | U: {u_stat:6.1f} | p: {p_val:.5f} ({sig})")
+
 
 def main() -> None:
     """Run a single demo evaluation with a randomly-weighted controller."""
 
-    database_path = DATA / f"{CROSSOVER}_seed_{SEED}.db"
+    parser = argparse.ArgumentParser(description="ARIEL Neuroevolution Rig")
+    parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44, 45, 46])
+    parser.add_argument("--pop-size", type=int, default=20)
+    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument(
+        "--crossover", type=str, choices=["n_point", "uniform"], default="n_point"
+    )
+    parser.add_argument("--n-cuts", type=int, default=4)
+    parser.add_argument(
+        "--mode", type=str, choices=["ea", "baseline", "analyze"], default="ea"
+    )
+    parser.add_argument(
+        "--experiments",
+        nargs="+",
+        type=str,
+        default=["n_point", "uniform", "baseline"],
+        help="List of experiment prefixes to compare during analysis.",
+    )
+
+    args = parser.parse_args()
+
     # A quick look at the size of the problem you are about to search.
     mj.set_mjcb_control(None)
     world = build_world()
@@ -573,39 +737,45 @@ def main() -> None:
 
     # run_experiment(MODE)
 
-    population = initialize_population(
-        n_individuals=STARTER_SIZE,
-        input_size=input_size,
-        output_size=output_size
-    )
-    
-    population = evaluate(
-        population=population,
-    )
+    if args.mode == "ea":
+        for seed in args.seeds:
+            console.log(f"\n--- Running EA [{args.crossover}] Seed: {seed} ---")
+            set_seed(seed)
+            rng = np.random.default_rng(seed)
 
-    ops: list[EAOperation] = [
-        EAOperation(parent_selection),
-        EAOperation(crossover),
-        EAOperation(mutate),
-        EAOperation(evaluate),
-        EAOperation(survivor_selection),
-        # EAOperation(log_progress),
-    ]
-    
-    ea = EA(
-        population,
-        ops,
-        num_steps=STEPS, 
-        is_maximisation=False, 
-        db_file_path=database_path,
-        db_handling="delete",
-        )
-    ea.run()
+            db_path = DATA / f"{args.crossover}_seed_{seed}.db"
+            pop = initialize_population(args.pop_size, input_size, output_size, rng)
+            pop = evaluate(pop)
 
-    console.log("--- Results ---")
-    console.log(f"best = {ea.get_solution('best', only_alive=False)}")
-    console.log(f"median = {ea.get_solution('median', only_alive=False)}")
-    console.log(f"worst = {ea.get_solution('worst', only_alive=False)}")
+            ops: list[EAOperation] = [
+                EAOperation(parent_selection),
+                EAOperation(create_crossover_operator(args.crossover, args.n_cuts, rng)),
+                EAOperation(mutate),
+                EAOperation(evaluate),
+                EAOperation(create_survivor_selection(args.pop_size)),
+            ]
+
+            ea = EA(
+                pop,
+                ops,
+                num_steps=args.steps,
+                is_maximisation=False,
+                db_file_path=db_path,
+                db_handling="delete",
+            )
+            ea.run()
+
+    elif args.mode == "baseline":
+        total_evals = args.pop_size * args.steps
+        for seed in args.seeds:
+            console.log(f"\n--- Running Baseline Seed: {seed} ---")
+            db_path = DATA / f"baseline_seed_{seed}.db"
+            run_random_search_baseline(
+                total_evals, input_size, output_size, seed, db_path
+            )
+
+    elif args.mode == "analyze":
+        analyze_and_plot(args.experiments, args.seeds, args.pop_size)
 
 
 if __name__ == "__main__":
