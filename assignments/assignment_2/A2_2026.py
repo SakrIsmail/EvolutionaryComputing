@@ -1,29 +1,3 @@
-"""EC A2 template code - neuroevolution for targeted locomotion with ARIEL.
-
-WHAT THIS FILE IS
------------------
-A *demo*, not a solution. It spawns a robot, drives it with a neural network
-whose weights are RANDOM, runs the simulation, and reports how close the robot
-ended up to a target.
-
-There is deliberately NO evolution in here. Building the EA (representation,
-initialisation, parent selection, variation, survivor selection) is the assignment.
-See "YOUR JOB" at the bottom of this file.
-
-THE ASSIGNMENT IN A NUTSHELL
-------------------------------
-Evolve the weights of a neural network controller so that a robot moves from
-SPAWN_POS to TARGET_POSITION within the simulation time.
-
-    fitness = distance between the robot's final position and TARGET_POSITION
-
-HOW TO RUN
-----------
-
-Change MODE below to switch between an interactive viewer, a headless run,
-a rendered video, or a single frame.
-"""
-
 # Standard library
 import argparse
 from tqdm import tqdm
@@ -43,6 +17,7 @@ from scipy.stats import kruskal, mannwhitneyu
 # Local libraries (ARIEL)
 from ariel import console
 from ariel.body_phenotypes.robogen_lite.modules.core import CoreModule
+
 # from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 from ariel.body_phenotypes.robogen_lite.prebuilt_robots.john_set import gecko
 from ariel.ec import set_seed
@@ -266,8 +241,7 @@ def _flatten_genotype(
 
 
 def _unflatten_genotype(
-    flat_array: npt.NDArray[np.float32] | list[float], 
-    shapes: list[tuple[int, ...]]
+    flat_array: npt.NDArray[np.float32] | list[float], shapes: list[tuple[int, ...]]
 ) -> list[list[float]]:
     """Reshapes a 1D flat array and returns standard Python lists for JSON serialization."""
     flat_array = np.asarray(flat_array)
@@ -296,6 +270,7 @@ def initialize_population(
 
     return Population(individuals)
 
+
 def evaluate(
     population: Population,
 ) -> Population:
@@ -305,6 +280,7 @@ def evaluate(
         individual.fitness = run_experiment(weights, mode="simple")
 
     return population
+
 
 def parent_selection(population: Population) -> Population:
 
@@ -322,22 +298,22 @@ def parent_selection(population: Population) -> Population:
 
     return shuffled
 
+
 def log_progress(population: Population) -> Population:
-    # Extract fitnesses of all currently alive individuals
     fitnesses = [ind.fitness_ for ind in population.alive if ind.fitness_ is not None]
-    
+
     if fitnesses:
         best = min(fitnesses)
         mean = sum(fitnesses) / len(fitnesses)
         worst = max(fitnesses)
-        pop_size = len(population.alive)  # Get the current population size
-        
+        pop_size = len(population.alive)
+
         console.log(f"--- Generation Progress ---")
         console.log(f"Population Size : {pop_size}")
         console.log(f"Best Fitness    : {best:.4f} (closest to target)")
         console.log(f"Mean Fitness    : {mean:.4f}")
         console.log(f"Worst Fitness   : {worst:.4f}")
-    
+
     return population
 
 
@@ -359,13 +335,14 @@ def uniform_crossover(
 
     return child_a, child_b
 
+
 def n_point_crossover(
     genotype_a: list[npt.NDArray[np.float64]],
     genotype_b: list[npt.NDArray[np.float64]],
     n_cuts: int,
     rng: np.random.Generator,
 ) -> tuple[list[npt.NDArray[np.float32]], list[npt.NDArray[np.float32]]]:
-    
+
     flat_a, shapes = _flatten_genotype(genotype_a)
     flat_b, _ = _flatten_genotype(genotype_b)
 
@@ -394,7 +371,10 @@ def n_point_crossover(
 
     return child_a, child_b
 
-def create_crossover_operator(crossover_type: str, n_cuts: int, rng: np.random.Generator):
+
+def create_crossover_operator(
+    crossover_type: str, n_cuts: int, rng: np.random.Generator
+):
     def crossover(
         population: Population,
     ) -> Population:
@@ -406,18 +386,12 @@ def create_crossover_operator(crossover_type: str, n_cuts: int, rng: np.random.G
 
             if crossover_type == "uniform":
                 child_genotype_a, child_genotype_b = uniform_crossover(
-                    parent_a.genotype,
-                    parent_b.genotype,
-                    rng
+                    parent_a.genotype, parent_b.genotype, rng
                 )
             elif crossover_type == "n_point":
                 child_genotype_a, child_genotype_b = n_point_crossover(
-                    parent_a.genotype,
-                    parent_b.genotype,
-                    n_cuts,
-                    rng
+                    parent_a.genotype, parent_b.genotype, n_cuts, rng
                 )
-
 
             child_a = Individual()
             child_a.genotype = child_genotype_a
@@ -430,24 +404,27 @@ def create_crossover_operator(crossover_type: str, n_cuts: int, rng: np.random.G
             population.extend([child_a, child_b])
 
         return population
+
     return crossover
+
 
 def mutate(population: Population) -> Population:
     for ind in population.where(lambda ind: bool(ind.tags.get("mutate", False))):
-        
+
         flat_genotype, shapes = _flatten_genotype(ind.genotype)
-        
+
         mutated_flat = FloatMutator.gaussian(
             flat_genotype,
             std=0.1,
-            mutation_probability=0.2,
+            mutation_probability=0.20,
         )
-        
+
         ind.genotype = _unflatten_genotype(mutated_flat, shapes)
-        
+
         ind.requires_eval = True
 
     return population
+
 
 def create_survivor_selection(target_pop_size: int):
     def survivor_selection(population: Population) -> Population:
@@ -463,6 +440,63 @@ def create_survivor_selection(target_pop_size: int):
 
         return population
     return survivor_selection
+
+
+class ConvergenceInterrupt(Exception):
+    """Raised inside EAOperation to stop the EA early."""
+
+    pass
+
+
+def create_convergence_checker(
+    patience: int = 10,
+    min_delta: float = 1e-4,
+    target_fitness: float = 0.0,
+    verbose: bool = True,
+    min_steps: int = 100,
+):
+    best_fitness = float("inf")
+    stagnant_gens = 0
+    current_gen = 0
+
+    def check_convergence(pop: Population) -> Population:
+        nonlocal best_fitness, stagnant_gens, current_gen
+        current_gen += 1
+
+        valid_fitnesses = [ind.fitness_ for ind in pop if ind.fitness_ is not None]
+        if not valid_fitnesses:
+            return pop
+
+        current_best = min(valid_fitnesses)
+
+        if current_gen < min_steps:
+            if current_best < best_fitness:
+                best_fitness = current_best
+            stagnant_gens = 0
+        else:
+            if (best_fitness - current_best) > min_delta:
+                best_fitness = current_best
+                stagnant_gens = 0
+            else:
+                stagnant_gens += 1
+
+        if verbose:
+            warmup_tag = " [Warm-up]" if current_gen < min_steps else ""
+            console.log(
+                f"Gen {current_gen:3d}{warmup_tag} | Curr Best: {current_best:.4f} | "
+                f"All-Time Best: {best_fitness:.4f} | Stagnant: {stagnant_gens}/{patience}"
+            )
+
+        if best_fitness <= target_fitness:
+            raise ConvergenceInterrupt(f"Target fitness reached ({best_fitness:.4f})")
+        if current_gen >= min_steps and stagnant_gens >= patience:
+            raise ConvergenceInterrupt(
+                f"Stagnated for {patience} generations after warm-up (Best fitness: {best_fitness:.4f})"
+            )
+
+        return pop
+
+    return check_convergence
 
 
 def run_experiment(weights, mode: ViewerTypes = MODE) -> float:
@@ -563,6 +597,7 @@ def run_experiment(weights, mode: ViewerTypes = MODE) -> float:
 
     return fitness
 
+
 def run_random_search_baseline(
     total_evaluations: int,
     input_size: int,
@@ -581,7 +616,6 @@ def run_random_search_baseline(
         "CREATE TABLE IF NOT EXISTS baseline (evaluation INT, best_fitness REAL)"
     )
 
-    # Wrap the range in tqdm to display progress and remaining time
     for eval_idx in tqdm(
         range(1, total_evaluations + 1),
         desc=f"Baseline Seed {seed}",
@@ -623,7 +657,9 @@ def analyze_and_plot(exp_names: list[str], seeds: list[int], pop_size: int = 20)
             if "baseline" in exp_name:
                 cursor.execute("SELECT best_fitness FROM baseline ORDER BY evaluation")
                 raw_vals = [r[0] for r in cursor.fetchall()]
-                vals = [raw_vals[i] for i in range(pop_size - 1, len(raw_vals), pop_size)]
+                vals = [
+                    raw_vals[i] for i in range(pop_size - 1, len(raw_vals), pop_size)
+                ]
             else:
                 cursor.execute(
                     "SELECT time_of_birth, MIN(fitness_) "
@@ -664,29 +700,38 @@ def analyze_and_plot(exp_names: list[str], seeds: list[int], pop_size: int = 20)
     ax.legend()
     ax.grid(True)
 
-    plot_path = DATA / "all_conditions_plot.png"
+    plot_path = DATA / "plot.png"
     plt.savefig(plot_path, dpi=300)
     console.log(f"\nCombined plot saved to: {plot_path}")
 
-    # --- STATISTICAL TESTS --- #
     console.log("\n=================== STATISTICAL ANALYSIS ===================")
     for exp_name, bests in results_by_exp.items():
-        console.log(f"{exp_name:15s} | Mean Best: {np.mean(bests):.4f} +/- {np.std(bests):.4f}")
+        console.log(
+            f"{exp_name:15s} | Mean Best: {np.mean(bests):.4f} +/- {np.std(bests):.4f}"
+        )
 
     if len(results_by_exp) >= 3:
         kw_stat, kw_p = kruskal(*results_by_exp.values())
-        console.log(f"\n--- Kruskal-Wallis Test (All Groups) ---")
+        console.log("\n--- Kruskal-Wallis Test (All Groups) ---")
         console.log(f"H-statistic: {kw_stat:.4f}, p-value: {kw_p:.5f}")
 
     num_pairs = len(list(combinations(results_by_exp.keys(), 2)))
     if num_pairs > 0:
         adjusted_alpha = 0.05 / num_pairs
-        console.log(f"\n--- Pairwise Mann-Whitney U (Bonferroni Adjusted Alpha = {adjusted_alpha:.4f}) ---")
+        console.log(
+            f"\n--- Pairwise Mann-Whitney U (Bonferroni Adjusted Alpha = {adjusted_alpha:.4f}) ---"
+        )
 
         for exp_a, exp_b in combinations(results_by_exp.keys(), 2):
-            u_stat, p_val = mannwhitneyu(results_by_exp[exp_a], results_by_exp[exp_b], alternative="two-sided")
+            u_stat, p_val = mannwhitneyu(
+                results_by_exp[exp_a],
+                results_by_exp[exp_b],
+                alternative="two-sided",
+            )
             sig = "SIGNIFICANT" if p_val < adjusted_alpha else "NOT significant"
-            console.log(f"{exp_a:12s} vs {exp_b:12s} | U: {u_stat:6.1f} | p: {p_val:.5f} ({sig})")
+            console.log(
+                f"{exp_a:12s} vs {exp_b:12s} | U: {u_stat:6.1f} | p: {p_val:.5f} ({sig})"
+            )
 
 
 def main() -> None:
@@ -695,11 +740,38 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ARIEL Neuroevolution Rig")
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44, 45, 46])
     parser.add_argument("--pop-size", type=int, default=20)
-    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--steps", type=int, default=500)
     parser.add_argument(
-        "--crossover", type=str, choices=["n_point", "uniform"], default="n_point"
+        "--crossover",
+        type=str,
+        choices=["n_point", "uniform"],
+        default="n_point",
     )
     parser.add_argument("--n-cuts", type=int, default=4)
+    parser.add_argument(
+        "--min-steps",
+        type=int,
+        default=100,
+        help="Minimum number of generations before early stopping can trigger.",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=20,
+        help="Number of generations without improvement before early stopping.",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum fitness improvement to reset convergence counter.",
+    )
+    parser.add_argument(
+        "--target-fitness",
+        type=float,
+        default=0.0,
+        help="Fitness threshold to trigger target early stop.",
+    )
     parser.add_argument(
         "--mode", type=str, choices=["ea", "baseline", "analyze"], default="ea"
     )
@@ -710,10 +782,10 @@ def main() -> None:
         default=["n_point", "uniform", "baseline"],
         help="List of experiment prefixes to compare during analysis.",
     )
+    parser.add_argument("--verbose", type=bool, default=True)
 
     args = parser.parse_args()
 
-    # A quick look at the size of the problem you are about to search.
     mj.set_mjcb_control(None)
     world = build_world()
     robot = build_robot()
@@ -727,15 +799,10 @@ def main() -> None:
 
     input_size = len(data.qpos)
     output_size = model.nu
-    num_weights = (
-        input_size * HIDDEN_SIZE
-        + HIDDEN_SIZE * output_size
-    )
+    num_weights = input_size * HIDDEN_SIZE + HIDDEN_SIZE * output_size
     console.log(f"controller inputs (len(data.qpos)) : {input_size}")
     console.log(f"controller outputs (model.nu)      : {output_size}")
     console.log(f"genotype length (total weights)    : {num_weights}")
-
-    # run_experiment(MODE)
 
     if args.mode == "ea":
         for seed in args.seeds:
@@ -749,10 +816,21 @@ def main() -> None:
 
             ops: list[EAOperation] = [
                 EAOperation(parent_selection),
-                EAOperation(create_crossover_operator(args.crossover, args.n_cuts, rng)),
+                EAOperation(
+                    create_crossover_operator(args.crossover, args.n_cuts, rng)
+                ),
                 EAOperation(mutate),
                 EAOperation(evaluate),
                 EAOperation(create_survivor_selection(args.pop_size)),
+                EAOperation(
+                    create_convergence_checker(
+                        patience=args.patience,
+                        min_delta=args.min_delta,
+                        target_fitness=args.target_fitness,
+                        verbose=args.verbose,
+                        min_steps=args.min_steps,
+                    )
+                ),
             ]
 
             ea = EA(
@@ -763,7 +841,12 @@ def main() -> None:
                 db_file_path=db_path,
                 db_handling="delete",
             )
-            ea.run()
+
+            try:
+                for gen in range(1, args.steps + 1):
+                    ea.step()
+            except ConvergenceInterrupt as e:
+                console.log(f"[Seed {seed}] Early stop at step {gen}: {e}")
 
     elif args.mode == "baseline":
         total_evals = args.pop_size * args.steps
