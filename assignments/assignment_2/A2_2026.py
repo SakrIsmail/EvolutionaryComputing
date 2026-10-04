@@ -371,6 +371,11 @@ def n_point_crossover(
 
     return child_a, child_b
 
+def clear_tags(population: Population) -> Population:
+    """Clear stale tags from previous generations."""
+    for ind in population:
+        ind.tags = {}
+    return population
 
 def create_crossover_operator(
     crossover_type: str, n_cuts: int, rng: np.random.Generator
@@ -416,7 +421,7 @@ def mutate(population: Population) -> Population:
         mutated_flat = FloatMutator.gaussian(
             flat_genotype,
             std=0.1,
-            mutation_probability=0.20,
+            mutation_probability=0.05,
         )
 
         ind.genotype = _unflatten_genotype(mutated_flat, shapes)
@@ -544,12 +549,12 @@ def run_experiment(weights, mode: ViewerTypes = MODE) -> float:
         actions = nn_controller(m, d, weights)
 
         # DIRECT application (see the controller contract above).
-        d.ctrl[:] = actions
+        # d.ctrl[:] = actions
 
         # DELTA application - comment out the line above and use these instead:
-        # delta = 0.05
-        # d.ctrl[:] += actions * delta
-        # d.ctrl[:] = np.clip(d.ctrl, -np.pi / 2, np.pi / 2)
+        delta = 0.05
+        d.ctrl[:] += actions * delta
+        d.ctrl[:] = np.clip(d.ctrl, -np.pi / 2, np.pi / 2)
 
     # --- Record the starting point ----------------------------------------- #
     initial_position = get_core_position(data)
@@ -633,18 +638,19 @@ def run_random_search_baseline(
     console.log(f"[Random Search Seed {seed}] Final Best Fitness: {best_fitness:.4f}")
 
 
-def analyze_and_plot(exp_names: list[str], seeds: list[int], pop_size: int = 20):
-    """Aggregates multi-seed DB files, plots mean +/- std curves, and performs 3-way statistical testing."""
+def analyze_and_plot(
+    exp_names: list[str], seeds: list[int], pop_size: int = 20
+):
+    """Aggregates multi-seed DB files, pads all runs to global T_max (LOCF),
+
+    plots mean +/- std curves, and performs 3-way statistical testing.
+    """
     colors = ["blue", "orange", "green", "purple", "red"]
-    results_by_exp = {}
+    raw_results_by_exp = {}
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-
-    for idx, exp_name in enumerate(exp_names):
-        color = colors[idx % len(colors)]
+    # STEP 1: Load all raw histories from databases
+    for exp_name in exp_names:
         seed_histories = []
-        final_bests = []
-
         for seed in seeds:
             db_file = DATA / f"{exp_name}_seed_{seed}.db"
             if not db_file.exists():
@@ -655,10 +661,13 @@ def analyze_and_plot(exp_names: list[str], seeds: list[int], pop_size: int = 20)
             cursor = conn.cursor()
 
             if "baseline" in exp_name:
-                cursor.execute("SELECT best_fitness FROM baseline ORDER BY evaluation")
+                cursor.execute(
+                    "SELECT best_fitness FROM baseline ORDER BY evaluation"
+                )
                 raw_vals = [r[0] for r in cursor.fetchall()]
-                vals = [
-                    raw_vals[i] for i in range(pop_size - 1, len(raw_vals), pop_size)
+                raw_bests = [
+                    raw_vals[i]
+                    for i in range(pop_size - 1, len(raw_vals), pop_size)
                 ]
             else:
                 cursor.execute(
@@ -669,30 +678,56 @@ def analyze_and_plot(exp_names: list[str], seeds: list[int], pop_size: int = 20)
                     "ORDER BY time_of_birth"
                 )
                 raw_bests = [r[1] for r in cursor.fetchall()]
-                vals = list(np.minimum.accumulate(raw_bests)) if raw_bests else []
 
             conn.close()
 
-            if vals:
+            if raw_bests:
+                # Monotonic best-so-far history
+                vals = list(np.minimum.accumulate(raw_bests))
                 seed_histories.append(vals)
-                final_bests.append(vals[-1])
 
         if seed_histories:
-            results_by_exp[exp_name] = final_bests
-            min_len = min(len(h) for h in seed_histories)
-            truncated = np.array([h[:min_len] for h in seed_histories])
-            mean_curve = np.mean(truncated, axis=0)
-            std_curve = np.std(truncated, axis=0)
+            raw_results_by_exp[exp_name] = seed_histories
 
-            steps = np.arange(1, min_len + 1)
-            ax.plot(steps, mean_curve, label=exp_name, color=color, linewidth=2)
-            ax.fill_between(
-                steps,
-                mean_curve - std_curve,
-                mean_curve + std_curve,
-                color=color,
-                alpha=0.15,
-            )
+    if not raw_results_by_exp:
+        console.log("No valid experiment data found.")
+        return
+
+    # STEP 2: Find global maximum generations across ALL experiments
+    global_max_len = max(
+        len(h) for histories in raw_results_by_exp.values() for h in histories
+    )
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    results_by_exp = {}
+
+    # STEP 3: Pad all seeds to global_max_len and plot
+    for idx, (exp_name, histories) in enumerate(raw_results_by_exp.items()):
+        color = colors[idx % len(colors)]
+
+        # Store final best values for stat tests
+        results_by_exp[exp_name] = [h[-1] for h in histories]
+
+        # Carry last observation forward up to global_max_len
+        padded = np.array(
+            [
+                np.pad(h, (0, global_max_len - len(h)), mode="edge")
+                for h in histories
+            ]
+        )
+
+        mean_curve = np.mean(padded, axis=0)
+        std_curve = np.std(padded, axis=0, ddof=1)
+
+        steps = np.arange(1, global_max_len + 1)
+        ax.plot(steps, mean_curve, label=exp_name, color=color, linewidth=2)
+        ax.fill_between(
+            steps,
+            mean_curve - std_curve,
+            mean_curve + std_curve,
+            color=color,
+            alpha=0.15,
+        )
 
     ax.set_xlabel("Generations")
     ax.set_ylabel("Fitness (Distance to Target)")
@@ -702,12 +737,14 @@ def analyze_and_plot(exp_names: list[str], seeds: list[int], pop_size: int = 20)
 
     plot_path = DATA / "plot.png"
     plt.savefig(plot_path, dpi=300)
+    plt.close(fig)
     console.log(f"\nCombined plot saved to: {plot_path}")
 
+    # STEP 4: Statistical Analysis
     console.log("\n=================== STATISTICAL ANALYSIS ===================")
     for exp_name, bests in results_by_exp.items():
         console.log(
-            f"{exp_name:15s} | Mean Best: {np.mean(bests):.4f} +/- {np.std(bests):.4f}"
+            f"{exp_name:15s} | Mean Best: {np.mean(bests):.4f} +/- {np.std(bests, ddof=1):.4f}"
         )
 
     if len(results_by_exp) >= 3:
@@ -728,7 +765,9 @@ def analyze_and_plot(exp_names: list[str], seeds: list[int], pop_size: int = 20)
                 results_by_exp[exp_b],
                 alternative="two-sided",
             )
-            sig = "SIGNIFICANT" if p_val < adjusted_alpha else "NOT significant"
+            sig = (
+                "SIGNIFICANT" if p_val < adjusted_alpha else "NOT significant"
+            )
             console.log(
                 f"{exp_a:12s} vs {exp_b:12s} | U: {u_stat:6.1f} | p: {p_val:.5f} ({sig})"
             )
@@ -747,7 +786,7 @@ def main() -> None:
         choices=["n_point", "uniform"],
         default="n_point",
     )
-    parser.add_argument("--n-cuts", type=int, default=4)
+    parser.add_argument("--n-cuts", type=int, default=2)
     parser.add_argument(
         "--min-steps",
         type=int,
@@ -815,6 +854,7 @@ def main() -> None:
             pop = evaluate(pop)
 
             ops: list[EAOperation] = [
+                EAOperation(clear_tags),
                 EAOperation(parent_selection),
                 EAOperation(
                     create_crossover_operator(args.crossover, args.n_cuts, rng)
