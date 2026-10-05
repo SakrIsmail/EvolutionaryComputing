@@ -126,11 +126,38 @@ def build_robot() -> CoreModule:
 # Controller architecture - decide before writing your EA.
 HIDDEN_SIZE: int = 6
 
+def get_controller_inputs(
+    data: mj.MjData, target_pos: np.ndarray, clock_freq: float = 1.0
+) -> npt.NDArray[np.float64]:
+    
+    # Core world position and relative target distance (2D)
+    core_pos = get_core_position(data)
+    rel_target = target_pos[:2] - core_pos[:2]
+
+    # Joint positions (excluding root free joint qpos[0:7]) and all velocities
+    joint_qpos = data.qpos[7:]
+    velocities = data.qvel
+
+    # Rhythmic clock signal
+    t = data.time
+    clock_sin = np.sin(2 * np.pi * clock_freq * t)
+    clock_cos = np.cos(2 * np.pi * clock_freq * t)
+
+    return np.concatenate(
+        [
+            joint_qpos,
+            velocities,
+            rel_target,
+            [clock_sin, clock_cos],
+        ]
+    )
+
 
 def nn_controller(
     model: mj.MjModel,
     data: mj.MjData,
     weights: list[npt.NDArray[np.float64]],
+    target_pos: np.ndarray = None,
 ) -> npt.NDArray[np.float64]:
     """Map robot state to hinge commands: in -> hidden -> actions.
 
@@ -153,16 +180,16 @@ def nn_controller(
     npt.NDArray[np.float64]
         `model.nu` action values, already scaled to [-pi/2, pi/2].
     """
-    w1, w2 = [np.asarray(w) for w in weights]
+    w1, b1, w2, b2 = [np.asarray(w) for w in weights]
 
     # --- INPUTS ---------------------------------------------------------- #
     # Bare qpos - the simplest choice, not necessarily a good one. See
     # YOUR JOB below.
-    inputs = data.qpos
+    inputs = get_controller_inputs(data, target_pos)
 
     # --- FORWARD PASS ----------------------------------------------------- #
-    layer1 = np.tanh(inputs @ w1)
-    outputs = np.tanh(layer1 @ w2)  # in [-1, 1]
+    layer1 = np.tanh(inputs @ w1 + b1)
+    outputs = np.tanh(layer1 @ w2 + b2)  # in [-1, 1]
 
     # --- RESCALE TO THE HINGE RANGE --------------------------------------- #
     return outputs * (np.pi / 2)  # in [-pi/2, pi/2]
@@ -183,8 +210,10 @@ def make_random_weights(
     genotype back into these matrices is on you.
     """
     return [
-        rng.normal(scale=0.5, size=(input_size, HIDDEN_SIZE)).tolist(),
-        rng.normal(scale=0.5, size=(HIDDEN_SIZE, output_size)).tolist(),
+        rng.normal(scale=0.5, size=(input_size, HIDDEN_SIZE)).tolist(),  # w1
+        rng.normal(scale=0.1, size=(HIDDEN_SIZE,)).tolist(),  # b1
+        rng.normal(scale=0.5, size=(HIDDEN_SIZE, output_size)).tolist(),  # w2
+        rng.normal(scale=0.1, size=(output_size,)).tolist(),  # b2
     ]
 
 
@@ -546,7 +575,7 @@ def run_experiment(weights, mode: ViewerTypes = MODE) -> float:
 
     def control_callback(m: mj.MjModel, d: mj.MjData) -> None:
         """Compute and apply actions; MuJoCo calls this every physics step."""
-        actions = nn_controller(m, d, weights)
+        actions = nn_controller(m, d, weights, target_pos=np.asarray(TARGET_POSITION))
 
         # DIRECT application (see the controller contract above).
         # d.ctrl[:] = actions
@@ -836,9 +865,16 @@ def main() -> None:
     model = world.spec.compile()
     data = mj.MjData(model)
 
-    input_size = len(data.qpos)
+    controller_inputs = get_controller_inputs(data, np.asarray(TARGET_POSITION))
+    input_size = len(controller_inputs)
     output_size = model.nu
-    num_weights = input_size * HIDDEN_SIZE + HIDDEN_SIZE * output_size
+
+    num_weights = (
+        input_size * HIDDEN_SIZE  # w1
+        + HIDDEN_SIZE  # b1
+        + HIDDEN_SIZE * output_size  # w2
+        + output_size  # b2
+    )
     console.log(f"controller inputs (len(data.qpos)) : {input_size}")
     console.log(f"controller outputs (model.nu)      : {output_size}")
     console.log(f"genotype length (total weights)    : {num_weights}")
