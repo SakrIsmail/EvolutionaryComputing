@@ -815,7 +815,7 @@ def main() -> None:
         choices=["n_point", "uniform"],
         default="n_point",
     )
-    parser.add_argument("--n-cuts", type=int, default=2)
+    parser.add_argument("--n-cuts", type=int, default=4)
     parser.add_argument(
         "--min-steps",
         type=int,
