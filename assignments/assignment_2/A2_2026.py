@@ -649,6 +649,7 @@ def run_random_search_baseline(
     cursor.execute(
         "CREATE TABLE IF NOT EXISTS baseline (evaluation INT, best_fitness REAL)"
     )
+    cursor.execute("DELETE FROM baseline")
 
     for eval_idx in tqdm(
         range(1, total_evaluations + 1),
@@ -668,7 +669,10 @@ def run_random_search_baseline(
 
 
 def analyze_and_plot(
-    exp_names: list[str], seeds: list[int], pop_size: int = 20
+    exp_names: list[str],
+    seeds: list[int],
+    pop_size: int = 20,
+    steps: int = 500,
 ):
     """Aggregates multi-seed DB files, pads all runs to global T_max (LOCF),
 
@@ -691,12 +695,19 @@ def analyze_and_plot(
 
             if "baseline" in exp_name:
                 cursor.execute(
-                    "SELECT best_fitness FROM baseline ORDER BY evaluation"
+                    "SELECT baseline.evaluation, baseline.best_fitness "
+                    "FROM baseline "
+                    "JOIN ("
+                    "    SELECT evaluation, MAX(rowid) AS latest_rowid "
+                    "    FROM baseline GROUP BY evaluation"
+                    ") AS latest ON baseline.rowid = latest.latest_rowid "
+                    "ORDER BY baseline.evaluation"
                 )
-                raw_vals = [r[0] for r in cursor.fetchall()]
+                baseline_rows = cursor.fetchall()
                 raw_bests = [
-                    raw_vals[i]
-                    for i in range(pop_size - 1, len(raw_vals), pop_size)
+                    fitness
+                    for evaluation, fitness in baseline_rows
+                    if evaluation % pop_size == 0
                 ]
             else:
                 cursor.execute(
@@ -713,6 +724,11 @@ def analyze_and_plot(
             if raw_bests:
                 # Monotonic best-so-far history
                 vals = list(np.minimum.accumulate(raw_bests))
+                if "baseline" not in exp_name:
+                    vals = vals[1 : steps + 1]
+                vals = vals[:steps]
+                if len(vals) < steps:
+                    vals.extend([vals[-1]] * (steps - len(vals)))
                 seed_histories.append(vals)
 
         if seed_histories:
@@ -721,11 +737,6 @@ def analyze_and_plot(
     if not raw_results_by_exp:
         console.log("No valid experiment data found.")
         return
-
-    # STEP 2: Find global maximum generations across ALL experiments
-    global_max_len = max(
-        len(h) for histories in raw_results_by_exp.values() for h in histories
-    )
 
     fig, ax = plt.subplots(figsize=(9, 5))
     results_by_exp = {}
@@ -736,22 +747,21 @@ def analyze_and_plot(
 
         # Store final best values for stat tests
         results_by_exp[exp_name] = [h[-1] for h in histories]
-
-        # Carry last observation forward up to global_max_len
-        padded = np.array(
-            [
-                np.pad(h, (0, global_max_len - len(h)), mode="edge")
-                for h in histories
-            ]
-        )
+        padded = np.asarray(histories, dtype=float)
 
         mean_curve = np.mean(padded, axis=0)
         std_curve = np.std(padded, axis=0, ddof=1)
 
-        steps = np.arange(1, global_max_len + 1)
-        ax.plot(steps, mean_curve, label=exp_name, color=color, linewidth=2)
+        generation_axis = np.arange(1, steps + 1)
+        ax.plot(
+            generation_axis,
+            mean_curve,
+            label=exp_name,
+            color=color,
+            linewidth=2,
+        )
         ax.fill_between(
-            steps,
+            generation_axis,
             mean_curve - std_curve,
             mean_curve + std_curve,
             color=color,
@@ -934,7 +944,12 @@ def main() -> None:
             )
 
     elif args.mode == "analyze":
-        analyze_and_plot(args.experiments, args.seeds, args.pop_size)
+        analyze_and_plot(
+            args.experiments,
+            args.seeds,
+            args.pop_size,
+            args.steps,
+        )
 
 
 if __name__ == "__main__":
