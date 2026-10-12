@@ -778,8 +778,7 @@ def analyze_and_plot(
     plt.savefig(plot_path, dpi=300)
     plt.close(fig)
     console.log(f"\nCombined plot saved to: {plot_path}")
-
-    # STEP 4: Statistical Analysis
+    
     console.log("\n=================== STATISTICAL ANALYSIS ===================")
     for exp_name, bests in results_by_exp.items():
         console.log(
